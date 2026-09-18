@@ -23,6 +23,7 @@ import (
 	"github.com/microsoft/agent-framework-go/tool/hostedtool"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
+	"github.com/openai/openai-go/v3/packages/param"
 	"github.com/openai/openai-go/v3/shared"
 )
 
@@ -331,6 +332,13 @@ func buildCompletionParams(model string, messages []*message.Message, opts []age
 					params.WebSearchOptions.SearchContextSize = contextSize
 				}
 			}
+			// The presence of web_search_options is what enables search on Chat
+			// Completions. With no location or context size set, the options struct
+			// is zero and the SDK omits it, which would silently drop the tool; send
+			// an explicit empty object instead.
+			if param.IsOmitted(params.WebSearchOptions) {
+				params.WebSearchOptions = param.Override[openai.ChatCompletionNewParamsWebSearchOptions](json.RawMessage(`{}`))
+			}
 		case tool.FuncTool:
 			name, description := tl.Name(), tl.Description()
 			schema := tl.Schema()
@@ -347,6 +355,13 @@ func buildCompletionParams(model string, messages []*message.Message, opts []age
 					},
 				},
 			})
+		case *hostedtool.FileSearch, *hostedtool.CodeInterpreter, *hostedtool.MCPServer:
+			// The Chat Completions API has no equivalent of these hosted tools, so the
+			// request cannot honour them. Fail loudly rather than dropping the tool and
+			// letting the model run without a capability the caller asked for.
+			return openai.ChatCompletionNewParams{}, fmt.Errorf("openaiprovider: hosted tool %T is not supported by the Chat Completions API; use NewResponsesAgent", tl)
+		default:
+			return openai.ChatCompletionNewParams{}, fmt.Errorf("openaiprovider: unsupported tool %q of type %T", tl.Name(), tl)
 		}
 	}
 	instructions := slices.Collect(agent.AllOptions(opts, agent.WithInstructions))

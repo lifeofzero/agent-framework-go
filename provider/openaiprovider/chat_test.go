@@ -23,6 +23,7 @@ import (
 	"github.com/microsoft/agent-framework-go/provider/openaiprovider"
 	"github.com/microsoft/agent-framework-go/tool"
 	"github.com/microsoft/agent-framework-go/tool/functool"
+	"github.com/microsoft/agent-framework-go/tool/hostedtool"
 	"github.com/openai/openai-go/v3"
 	"github.com/openai/openai-go/v3/option"
 )
@@ -2413,5 +2414,123 @@ func TestChatAssistantRefusal_ReplaysAsRefusal(t *testing.T) {
 	}
 	if assistant["content"] == "I cannot help with that" {
 		t.Fatal("refusal was replayed as ordinary assistant text")
+	}
+}
+
+// chatStubServer answers any Chat Completions request with "ok" and counts requests.
+func chatStubServer(t *testing.T, requests *atomic.Int32, bodyCh chan<- []byte) *httptest.Server {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		body, _ := io.ReadAll(r.Body)
+		if bodyCh != nil {
+			bodyCh <- body
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"id":"chatcmpl-test","object":"chat.completion","created":1727888631,"model":"gpt-4o-mini","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]}`)
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// Hosted tools the Chat Completions API cannot run must fail the run before any
+// request is sent, rather than being dropped so the model runs without them.
+func TestChatUnsupportedHostedToolsReturnError(t *testing.T) {
+	cases := []struct {
+		name string
+		tool tool.Tool
+	}{
+		{"file search", &hostedtool.FileSearch{}},
+		{"code interpreter", &hostedtool.CodeInterpreter{}},
+		{"mcp server", &hostedtool.MCPServer{ServerName: "docs", ServerAddress: "https://example.com/mcp"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := chatStubServer(t, &requests, nil)
+
+			_, err := newTestClient(server).RunText(t.Context(), "hello", agent.WithTool(tc.tool)).Collect()
+			if err == nil {
+				t.Fatalf("expected an error for hosted tool %T, got none", tc.tool)
+			}
+			if !strings.Contains(err.Error(), "not supported by the Chat Completions API") {
+				t.Fatalf("error = %q, want it to say the tool is not supported by the Chat Completions API", err)
+			}
+			if n := requests.Load(); n != 0 {
+				t.Fatalf("sent %d request(s), want 0: the run must fail before calling the API", n)
+			}
+		})
+	}
+}
+
+// declarationOnlyTool implements tool.Tool but none of the richer tool interfaces.
+type declarationOnlyTool struct{}
+
+func (declarationOnlyTool) Name() string        { return "mystery" }
+func (declarationOnlyTool) Description() string { return "a tool the provider cannot express" }
+
+func TestChatUnknownToolTypeReturnsError(t *testing.T) {
+	var requests atomic.Int32
+	server := chatStubServer(t, &requests, nil)
+
+	_, err := newTestClient(server).RunText(t.Context(), "hello", agent.WithTool(declarationOnlyTool{})).Collect()
+	if err == nil {
+		t.Fatal("expected an error for an unsupported tool type, got none")
+	}
+	if !strings.Contains(err.Error(), `unsupported tool "mystery"`) {
+		t.Fatalf("error = %q, want it to name the unsupported tool", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Fatalf("sent %d request(s), want 0", n)
+	}
+}
+
+// Supported tools are unaffected: web search and function tools still reach the request.
+func TestChatSupportedToolsStillSent(t *testing.T) {
+	var requests atomic.Int32
+	bodyCh := make(chan []byte, 1)
+	server := chatStubServer(t, &requests, bodyCh)
+
+	fn := functool.MustNew(functool.Config{Name: "lookup"}, func(context.Context, struct{}) (string, error) {
+		return "x", nil
+	})
+	_, err := newTestClient(server).RunText(t.Context(), "hello",
+		agent.WithTool(&hostedtool.WebSearch{}),
+		agent.WithTool(fn),
+	).Collect()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(<-bodyCh, &request); err != nil {
+		t.Fatal(err)
+	}
+	opts, ok := request["web_search_options"].(map[string]any)
+	if !ok || len(opts) != 0 {
+		t.Fatalf("web_search_options = %#v, want an empty object for a bare web search", request["web_search_options"])
+	}
+	tools, _ := request["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("got %d function tools in request, want 1: %v", len(tools), tools)
+	}
+}
+
+// Configured web search options are sent as-is, not replaced by the empty object.
+func TestChatWebSearchOptionsPreserved(t *testing.T) {
+	var requests atomic.Int32
+	bodyCh := make(chan []byte, 1)
+	server := chatStubServer(t, &requests, bodyCh)
+
+	ws := &hostedtool.WebSearch{AdditionalProperties: map[string]any{"search_context_size": "high"}}
+	if _, err := newTestClient(server).RunText(t.Context(), "hello", agent.WithTool(ws)).Collect(); err != nil {
+		t.Fatal(err)
+	}
+	var request map[string]any
+	if err := json.Unmarshal(<-bodyCh, &request); err != nil {
+		t.Fatal(err)
+	}
+	opts, _ := request["web_search_options"].(map[string]any)
+	if opts["search_context_size"] != "high" {
+		t.Fatalf("web_search_options = %#v, want search_context_size high", request["web_search_options"])
 	}
 }
