@@ -1771,3 +1771,190 @@ func TestBuildMessageParam_DataURIImageForwardedAsBase64(t *testing.T) {
 		t.Fatalf("expected data: URIContent image forwarded as a base64 image source, got: %s", body)
 	}
 }
+
+// --- Prompt caching (cache_control) ----------------------------------------
+//
+// Black-box wire-format tests: they mark content with the exported
+// WithCacheControl and assert the cache_control breakpoint on the captured
+// outbound request, exercising the public agent path rather than internals.
+
+// captureCacheRequest runs msgs through the agent against a stub server and
+// returns the outbound Anthropic request decoded as JSON.
+func captureCacheRequest(t *testing.T, msgs []*message.Message) map[string]any {
+	t.Helper()
+	bodyCh := make(chan []byte, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+		}
+		bodyCh <- body
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintln(w, `{"id":"msg","type":"message","role":"assistant","model":"m","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`)
+	}))
+	defer server.Close()
+
+	a := newTestClient(t, server)
+	if _, err := a.Run(t.Context(), msgs).Collect(); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	var out map[string]any
+	if err := json.Unmarshal(<-bodyCh, &out); err != nil {
+		t.Fatalf("unmarshal request body: %v", err)
+	}
+	return out
+}
+
+// lastMessageContentBlocks returns the decoded content blocks of the final
+// request message.
+func lastMessageContentBlocks(t *testing.T, out map[string]any) []any {
+	t.Helper()
+	msgs, _ := out["messages"].([]any)
+	if len(msgs) == 0 {
+		t.Fatal("expected at least one message")
+	}
+	blocks, _ := msgs[len(msgs)-1].(map[string]any)["content"].([]any)
+	if len(blocks) == 0 {
+		t.Fatal("expected content blocks on the last message")
+	}
+	return blocks
+}
+
+// Opt-in, not default: an unmarked content must produce no cache_control anywhere.
+// A cache WRITE costs more than a plain input token, so caching must never turn
+// itself on and quietly raise the bill for a short single-turn agent.
+func TestCacheControl_AbsentWhenUnmarked(t *testing.T) {
+	msg := &message.Message{Role: message.RoleUser, Contents: []message.Content{
+		&message.TextContent{Text: "hi"},
+	}}
+	out := captureCacheRequest(t, []*message.Message{msg})
+	raw, _ := json.Marshal(out)
+	if strings.Contains(string(raw), "cache_control") {
+		t.Fatalf("cache_control present on an unmarked request:\n%s", raw)
+	}
+}
+
+// A text content marked with WithCacheControl must produce a cache_control
+// breakpoint on exactly the block built from it, defaulting to the 5-minute tier
+// (no ttl on the wire).
+func TestCacheControl_MarksTextBlock(t *testing.T) {
+	msg := &message.Message{Role: message.RoleUser, Contents: []message.Content{
+		anthropicprovider.WithCacheControl(&message.TextContent{Text: "cache me"}),
+	}}
+	out := captureCacheRequest(t, []*message.Message{msg})
+
+	blocks := lastMessageContentBlocks(t, out)
+	last, _ := blocks[len(blocks)-1].(map[string]any)
+	cc, ok := last["cache_control"].(map[string]any)
+	if !ok {
+		t.Fatalf("no cache_control on the marked text block: %v", last)
+	}
+	if cc["type"] != "ephemeral" {
+		t.Fatalf("cache_control type = %v, want ephemeral", cc["type"])
+	}
+	if _, present := cc["ttl"]; present {
+		t.Fatalf("default breakpoint should carry no ttl, got %v", cc["ttl"])
+	}
+}
+
+// TTL flows through: an explicit 1-hour marker lands ttl=1h on the wire, and the
+// explicit 5-minute tier is a distinct real value.
+func TestCacheControl_TTLFlowsThrough(t *testing.T) {
+	msg1h := &message.Message{Role: message.RoleUser, Contents: []message.Content{
+		anthropicprovider.WithCacheControl(&message.TextContent{Text: "an hour"}, anthropicprovider.WithTTL(anthropicprovider.Ephemeral1h)),
+	}}
+	out1h := captureCacheRequest(t, []*message.Message{msg1h})
+	blocks1h := lastMessageContentBlocks(t, out1h)
+	cc1h, _ := blocks1h[len(blocks1h)-1].(map[string]any)["cache_control"].(map[string]any)
+	if cc1h["ttl"] != "1h" {
+		t.Fatalf("cache_control ttl = %v, want 1h", cc1h["ttl"])
+	}
+
+	msg5m := &message.Message{Role: message.RoleUser, Contents: []message.Content{
+		anthropicprovider.WithCacheControl(&message.TextContent{Text: "five minutes"}, anthropicprovider.WithTTL(anthropicprovider.Ephemeral5m)),
+	}}
+	out5m := captureCacheRequest(t, []*message.Message{msg5m})
+	blocks5m := lastMessageContentBlocks(t, out5m)
+	cc5m, _ := blocks5m[len(blocks5m)-1].(map[string]any)["cache_control"].(map[string]any)
+	if cc5m["ttl"] != "5m" {
+		t.Fatalf("explicit 5m ttl = %v, want 5m", cc5m["ttl"])
+	}
+}
+
+// Every block type buildMessageParam produces carries the breakpoint on the wire
+// when its content is marked with WithCacheControl.
+func TestCacheControl_MarksEveryBlockType(t *testing.T) {
+	cases := []struct {
+		name     string
+		role     message.Role
+		content  message.Content
+		wantType string
+	}{
+		{"text", message.RoleUser, anthropicprovider.WithCacheControl(&message.TextContent{Text: "hi"}), "text"},
+		{"image", message.RoleUser, anthropicprovider.WithCacheControl(&message.DataContent{MediaType: "image/png", Data: "aGVsbG8="}), "image"},
+		{"pdf data", message.RoleUser, anthropicprovider.WithCacheControl(&message.DataContent{MediaType: "application/pdf", Data: "JVBERi0="}), "document"},
+		{"image url", message.RoleUser, anthropicprovider.WithCacheControl(&message.URIContent{MediaType: "image/png", URI: "https://example.com/a.png"}), "image"},
+		{"pdf url", message.RoleUser, anthropicprovider.WithCacheControl(&message.URIContent{MediaType: "application/pdf", URI: "https://example.com/a.pdf"}), "document"},
+		{"image data uri", message.RoleUser, anthropicprovider.WithCacheControl(&message.URIContent{URI: "data:image/png;base64,aGVsbG8="}), "image"},
+		{"tool use", message.RoleAssistant, anthropicprovider.WithCacheControl(&message.FunctionCallContent{CallID: "call_1", Name: "lookup", Arguments: `{"q":"x"}`}), "tool_use"},
+		{"tool result", message.RoleTool, anthropicprovider.WithCacheControl(&message.FunctionResultContent{CallID: "call_1", Result: "a large, stable tool result"}), "tool_result"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			msg := &message.Message{Role: tc.role, Contents: []message.Content{tc.content}}
+			out := captureCacheRequest(t, []*message.Message{msg})
+			blocks := lastMessageContentBlocks(t, out)
+			last, _ := blocks[len(blocks)-1].(map[string]any)
+			if last["type"] != tc.wantType {
+				t.Fatalf("block type = %v, want %v", last["type"], tc.wantType)
+			}
+			if _, ok := last["cache_control"]; !ok {
+				t.Fatalf("no cache_control on the marked %s block: %v", tc.wantType, last)
+			}
+		})
+	}
+}
+
+// A thinking block has no cache_control field on the wire, so a marker on
+// reasoning content is dropped rather than failing the request.
+func TestCacheControl_ThinkingBlockIsNoOp(t *testing.T) {
+	msg := &message.Message{Role: message.RoleAssistant, Contents: []message.Content{
+		anthropicprovider.WithCacheControl(&message.TextReasoningContent{Text: "thinking", ProtectedData: "sig"}),
+		&message.TextContent{Text: "answer"},
+	}}
+	out := captureCacheRequest(t, []*message.Message{msg})
+
+	blocks := lastMessageContentBlocks(t, out)
+	for _, b := range blocks {
+		block, _ := b.(map[string]any)
+		if _, ok := block["cache_control"]; ok {
+			t.Fatalf("%v block carries cache_control, want none: %v", block["type"], block)
+		}
+	}
+	if first, _ := blocks[0].(map[string]any); first["type"] != "thinking" {
+		t.Fatalf("first block type = %v, want thinking", first["type"])
+	}
+}
+
+// Only the marked content becomes a breakpoint; its unmarked neighbours are
+// emitted unchanged.
+func TestCacheControl_OnlyMarkedBlock(t *testing.T) {
+	msg := &message.Message{Role: message.RoleUser, Contents: []message.Content{
+		&message.TextContent{Text: "before"},
+		anthropicprovider.WithCacheControl(&message.TextContent{Text: "marked"}),
+		&message.TextContent{Text: "after"},
+	}}
+	out := captureCacheRequest(t, []*message.Message{msg})
+
+	blocks := lastMessageContentBlocks(t, out)
+	if len(blocks) != 3 {
+		t.Fatalf("got %d blocks, want 3", len(blocks))
+	}
+	for i, b := range blocks {
+		block, _ := b.(map[string]any)
+		_, marked := block["cache_control"]
+		if want := i == 1; marked != want {
+			t.Fatalf("block %d (%v): cache_control present = %v, want %v", i, block["text"], marked, want)
+		}
+	}
+}

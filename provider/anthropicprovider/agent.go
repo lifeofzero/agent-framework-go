@@ -874,6 +874,7 @@ func buildMessageParam(msg *message.Message) (anthropic.MessageParam, error) {
 	var content []anthropic.ContentBlockParamUnion
 
 	for _, c := range msg.Contents {
+		start := len(content)
 		switch c := c.(type) {
 		case *message.TextContent:
 			content = append(content, anthropic.NewTextBlock(c.Text))
@@ -982,6 +983,10 @@ func buildMessageParam(msg *message.Message) (anthropic.MessageParam, error) {
 			// explicit error rather than silently dropping it.
 			return anthropic.MessageParam{}, fmt.Errorf("anthropic: hosted file references (file id %q) are not supported by the Messages API; use DataContent or URIContent instead", c.FileID)
 		}
+		// Carry a WithCacheControl marker from the content onto the block built for it.
+		// Applied after the switch, so every block type is covered without per-case
+		// wiring, including content that produced no block (a no-op).
+		applyContentCacheControl(c, content[start:])
 	}
 
 	switch msg.Role {
